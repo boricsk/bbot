@@ -5,8 +5,26 @@ from bbot.modules.base import BaseModule
 
 
 hunt_param_dict = {
-    "cmdi": ["daemon", "host", "upload", "dir", "execute", "download", "log", "ip", "cli", "cmd"],
-    "debug": [
+    "Command Injection": [
+        "daemon",
+        "host",
+        "upload",
+        "dir",
+        "execute",
+        "download",
+        "log",
+        "ip",
+        "cli",
+        "cmd",
+        "exec",
+        "command",
+        "func",
+        "code",
+        "update",
+        "shell",
+        "eval",
+    ],
+    "Debug": [
         "access",
         "admin",
         "dbg",
@@ -34,8 +52,31 @@ hunt_param_dict = {
         "cfg",
         "config",
     ],
-    "lfi": ["file", "document", "folder", "root", "path", "pg", "style", "pdf", "template", "php_path", "doc"],
-    "idor": [
+    "Directory Traversal": ["entry", "download", "attachment", "basepath", "path", "file", "source", "dest"],
+    "Local File Include": [
+        "file",
+        "document",
+        "folder",
+        "root",
+        "path",
+        "pg",
+        "style",
+        "pdf",
+        "template",
+        "php_path",
+        "doc",
+        "lang",
+        "include",
+        "img",
+        "view",
+        "layout",
+        "export",
+        "log",
+        "configFile",
+        "stylesheet",
+        "configFileUrl",
+    ],
+    "Insecure Direct Object Reference": [
         "id",
         "user",
         "account",
@@ -49,10 +90,20 @@ hunt_param_dict = {
         "profile",
         "edit",
         "report",
+        "docId",
+        "accountId",
+        "customerId",
+        "reportId",
+        "jobId",
+        "sessionId",
+        "api_key",
+        "instance",
+        "identifier",
+        "access",
     ],
-    "sqli": [
+    "SQL Injection": [
         "id",
-        "select",
+        "" "select",
         "report",
         "role",
         "update",
@@ -81,8 +132,23 @@ hunt_param_dict = {
         "string",
         "number",
         "filter",
+        "limit",
+        "offset",
+        "item",
+        "input",
+        "date",
+        "value",
+        "orderBy",
+        "groupBy",
+        "pageNum",
+        "pageSize",
+        "tag",
+        "author",
+        "postId",
+        "parentId",
+        "d",
     ],
-    "ssrf": [
+    "Server-side Request Forgery": [
         "dest",
         "redirect",
         "uri",
@@ -111,8 +177,98 @@ hunt_param_dict = {
         "show",
         "navigation",
         "open",
+        "proxy",
+        "target",
+        "server",
+        "domain",
+        "connect",
+        "fetch",
+        "apiEndpoint",
     ],
-    "ssti": ["template", "preview", "id", "view", "activity", "name", "content", "redirect"],
+    "Server-Side Template Injection": [
+        "template",
+        "preview",
+        "id",
+        "view",
+        "activity",
+        "name",
+        "content",
+        "redirect",
+        "expression",
+        "statement",
+        "tpl",
+        "render",
+        "format",
+        "engine",
+    ],
+    "XML external entity injection": [
+        "xml",
+        "dtd",
+        "xsd",
+        "xmlDoc",
+        "xmlData",
+        "entityType",
+        "entity",
+        "xmlUrl",
+        "schema",
+        "xmlFile",
+        "xmlPath",
+        "xmlSource",
+        "xmlEndpoint",
+        "xslt",
+        "xmlConfig",
+        "xmlCallback",
+        "attributeName",
+        "wsdl",
+        "xmlDocUrl",
+    ],
+    "Insecure Cryptography": [
+        "encrypted",
+        "cipher",
+        "iv",
+        "checksum",
+        "hash",
+        "salt",
+        "hmac",
+        "secret",
+        "key",
+        "signatureAlgorithm",
+        "keyId",
+        "sharedSecret",
+        "privateKeyId",
+        "privateKey",
+        "publicKey",
+        "publicKeyId",
+        "encryptedData",
+        "encryptedMessage",
+        "encryptedPayload",
+        "encryptedFile",
+        "cipherText",
+        "cipherAlgorithm",
+        "keySize",
+        "keyPair",
+        "keyDerivation",
+        "encryptionMethod",
+        "decryptionKey",
+    ],
+    "Unsafe Deserialization": [
+        "serialized",
+        "object",
+        "dataObject",
+        "serialization",
+        "payload",
+        "encoded",
+        "marshalled",
+        "pickled",
+        "jsonData",
+        "state",
+        "sessionData",
+        "cache",
+        "tokenData",
+        "serializedSession",
+        "objectState",
+        "jsonDataPayload",
+    ],
 }
 
 
@@ -124,13 +280,12 @@ class hunt(BaseModule):
 
     watched_events = ["HTTP_RESPONSE"]
     produced_events = ["FINDING"]
-    flags = ["active", "safe", "web-advanced"]
+    flags = ["active", "safe", "web-basic", "web-thorough"]
     meta = {"description": "Watch for commonly-exploitable HTTP parameters"}
     # accept all events regardless of scope distance
     scope_distance_modifier = None
 
     def extract_params(self, body):
-
         # check for input tags
         input_tag = self.input_tag_regex.findall(body)
 
@@ -172,7 +327,7 @@ class hunt(BaseModule):
                     yield s
 
     def handle_event(self, event):
-        body = event.data.get("response-body", "")
+        body = event.data.get("body", "")
         for p in self.extract_params(body):
             for k in hunt_param_dict.keys():
                 if p.lower() in hunt_param_dict[k]:

@@ -1,3 +1,4 @@
+import os
 import logging
 from pathlib import Path
 from threading import Lock
@@ -6,18 +7,20 @@ from . import misc
 from .dns import DNSHelper
 from .diff import HttpCompare
 from .wordcloud import WordCloud
+from .cloud import CloudProviders
 from .interactsh import Interactsh
 from .threadpool import as_completed
 from ...modules.base import BaseModule
 from .depsinstaller import DepsInstaller
+
 
 log = logging.getLogger("bbot.core.helpers")
 
 
 class ConfigAwareHelper:
     from .web import wordlist, request, download, api_page_iter, curl
-    from .command import run, run_live, tempfile, feed_pipe, _feed_pipe
     from .cache import cache_get, cache_put, cache_filename, is_cached, CacheDict
+    from .command import run, run_live, tempfile, feed_pipe, _feed_pipe, tempfile_tail
     from . import ntlm
     from . import regexes
     from . import validators
@@ -38,8 +41,6 @@ class ConfigAwareHelper:
         self.mkdir(self.temp_dir)
         self.mkdir(self.tools_dir)
         self.mkdir(self.lib_dir)
-        # holds requests CachedSession() objects for duration of scan
-        self.cache_sessions = dict()
         self._futures = set()
         self._future_lock = Lock()
 
@@ -48,12 +49,14 @@ class ConfigAwareHelper:
         self.word_cloud = WordCloud(self)
         self.dummy_modules = {}
 
+        # cloud helpers
+        self.cloud = CloudProviders(self)
+
     def interactsh(self):
         return Interactsh(self)
 
-    def http_compare(self, url, allow_redirects=False):
-
-        return HttpCompare(url, self, allow_redirects=allow_redirects)
+    def http_compare(self, url, allow_redirects=False, include_cache_buster=True):
+        return HttpCompare(url, self, allow_redirects=allow_redirects, include_cache_buster=include_cache_buster)
 
     def temp_filename(self):
         """
@@ -73,11 +76,19 @@ class ConfigAwareHelper:
             self._scan = Scanner()
         return self._scan
 
+    @property
+    def scan_stopping(self):
+        return getattr(self.scan, "stopping", False)
+
+    @property
+    def in_tests(self):
+        return os.environ.get("BBOT_TESTING", "") == "True"
+
     @staticmethod
     def as_completed(*args, **kwargs):
         return as_completed(*args, **kwargs)
 
-    def _make_dummy_module(self, name, _type):
+    def _make_dummy_module(self, name, _type="scan"):
         """
         Construct a dummy module, for attachment to events
         """
@@ -109,6 +120,8 @@ class ConfigAwareHelper:
 
 
 class DummyModule(BaseModule):
+    _priority = 4
+
     def __init__(self, *args, **kwargs):
         self._name = kwargs.pop("name")
         self._type = kwargs.pop("_type")

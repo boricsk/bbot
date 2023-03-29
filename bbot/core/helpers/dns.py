@@ -1,15 +1,17 @@
 import re
 import json
 import logging
+import ipaddress
+import traceback
+import cloudcheck
 import dns.resolver
 import dns.exception
 from threading import Lock
 from contextlib import suppress
-from concurrent.futures import ThreadPoolExecutor
 
 from .regexes import dns_name_regex
-from .threadpool import ThreadPoolWrapper, NamedLock
 from bbot.core.errors import ValidationError, DNSError
+from .threadpool import NamedLock, PatchedThreadPoolExecutor
 from .misc import is_ip, is_domain, domain_parents, parent_domain, rand_string
 
 log = logging.getLogger("bbot.core.helpers.dns")
@@ -20,10 +22,10 @@ class DNSHelper:
     For automatic wildcard detection, nameserver validation, etc.
     """
 
+    nameservers_url = "https://public-dns.info/nameserver/nameservers.json"
     all_rdtypes = ["A", "AAAA", "SRV", "MX", "NS", "SOA", "CNAME", "TXT"]
 
     def __init__(self, parent_helper):
-
         self.parent_helper = parent_helper
         try:
             self.resolver = dns.resolver.Resolver()
@@ -32,6 +34,7 @@ class DNSHelper:
         self.timeout = self.parent_helper.config.get("dns_timeout", 5)
         self.retries = self.parent_helper.config.get("dns_retries", 1)
         self.abort_threshold = self.parent_helper.config.get("dns_abort_threshold", 5)
+        self.max_dns_resolve_distance = self.parent_helper.config.get("max_dns_resolve_distance", 4)
         self.resolver.timeout = self.timeout
         self.resolver.lifetime = self.timeout
         self._resolver_list = None
@@ -46,7 +49,7 @@ class DNSHelper:
         # modules from kicking off wildcard detection for the same domain at the same time
         self._wildcard_lock = NamedLock()
         # keeps track of warnings issued for wildcard detection to prevent duplicate warnings
-        self._wildcard_warnings = set()
+        self._dns_warnings = set()
 
         self._errors = dict()
         self._error_lock = Lock()
@@ -55,8 +58,7 @@ class DNSHelper:
 
         # we need our own threadpool because using the shared one can lead to deadlocks
         max_workers = self.parent_helper.config.get("max_dns_threads", 100)
-        executor = ThreadPoolExecutor(max_workers=max_workers)
-        self._thread_pool = ThreadPoolWrapper(executor, max_workers=max_workers)
+        self._thread_pool = PatchedThreadPoolExecutor(max_workers=max_workers)
 
         self._debug = self.parent_helper.config.get("dns_debug", False)
 
@@ -88,7 +90,7 @@ class DNSHelper:
         """
         results = set()
         raw_results, errors = self.resolve_raw(query, **kwargs)
-        for (rdtype, answers) in raw_results:
+        for rdtype, answers in raw_results:
             for answer in answers:
                 for _, t in self.extract_targets(answer):
                     results.add(t)
@@ -98,8 +100,6 @@ class DNSHelper:
         # DNS over TCP is more reliable
         # But setting this breaks DNS resolution on Ubuntu because systemd-resolve doesn't support TCP
         # kwargs["tcp"] = True
-        if self.parent_helper.scan.stopping:
-            return [], []
         query = str(query).strip()
         if is_ip(query):
             kwargs.pop("type", None)
@@ -121,8 +121,6 @@ class DNSHelper:
                 elif any([isinstance(t, x) for x in (list, tuple)]):
                     types = [str(_).strip().upper() for _ in t]
             for t in types:
-                if getattr(self.parent_helper.scan, "stopping", False) == True:
-                    break
                 r, e = self._resolve_hostname(query, rdtype=t, **kwargs)
                 if r:
                     results.append((t, r))
@@ -130,6 +128,12 @@ class DNSHelper:
                     errors.append((t, error))
 
             return (results, errors)
+
+    def submit_task(self, *args, **kwargs):
+        try:
+            return self._thread_pool.submit(*args, **kwargs)
+        except RuntimeError as e:
+            log.debug(f"Error submitting DNS thread task: {e}")
 
     def _resolve_hostname(self, query, **kwargs):
         self.debug(f"Resolving {query} with kwargs={kwargs}")
@@ -143,16 +147,18 @@ class DNSHelper:
         parent_hash = hash(f"{parent}:{rdtype}")
         dns_cache_hash = hash(f"{query}:{rdtype}")
         while tries_left > 0:
-            error_count = self._errors.get(parent_hash, 0)
-            if error_count >= self.abort_threshold:
-                log.verbose(
-                    f'Aborting query "{query}" because failed {rdtype} queries for "{parent}" ({error_count:,}) exceeded abort threshold ({self.abort_threshold:,})'
-                )
-                return results, errors
+            if self.parent_helper.scan_stopping:
+                break
             try:
                 try:
                     results = self._dns_cache[dns_cache_hash]
                 except KeyError:
+                    error_count = self._errors.get(parent_hash, 0)
+                    if error_count >= self.abort_threshold:
+                        log.verbose(
+                            f'Aborting query "{query}" because failed {rdtype} queries for "{parent}" ({error_count:,}) exceeded abort threshold ({self.abort_threshold:,})'
+                        )
+                        return results, errors
                     results = list(self._catch(self.resolver.resolve, query, **kwargs))
                     if cache_result:
                         self._dns_cache[dns_cache_hash] = results
@@ -166,10 +172,10 @@ class DNSHelper:
                         self._errors[parent_hash] += 1
                     except KeyError:
                         self._errors[parent_hash] = 1
-                    log.verbose(
-                        f'DNS error or timeout for {rdtype} query "{query}" ({self._errors[parent_hash]:,} so far): {e}'
-                    )
-                    errors.append(e)
+                log.verbose(
+                    f'DNS error or timeout for {rdtype} query "{query}" ({self._errors[parent_hash]:,} so far): {e}'
+                )
+                errors.append(e)
                 # don't retry if we get a SERVFAIL
                 if isinstance(e, dns.resolver.NoNameservers):
                     break
@@ -190,6 +196,8 @@ class DNSHelper:
         errors = []
         dns_cache_hash = hash(f"{query}:PTR")
         while tries_left > 0:
+            if self.parent_helper.scan_stopping:
+                break
             try:
                 if dns_cache_hash in self._dns_cache:
                     result = self._dns_cache[dns_cache_hash]
@@ -212,81 +220,100 @@ class DNSHelper:
         self.debug(f"Results for {query} with kwargs={kwargs}: {results}")
         return results, errors
 
-    def resolve_event(self, event):
-        result = self._resolve_event(event)
+    def resolve_event(self, event, minimal=False):
+        log.debug(f"Resolving {event}")
+        result = self._resolve_event(event, minimal=minimal)
         # if it's a wildcard, go again with _wildcard.{domain}
-        if len(result) == 1:
-            event = result[0]
-            return self._resolve_event(event, check_wildcard=False)
+        if len(result) == 2:
+            event, wildcard_rdtypes = result
+            return self._resolve_event(event, minimal=minimal, _wildcard_rdtypes=wildcard_rdtypes)
         # else we're good
         else:
             return result
 
-    def _resolve_event(self, event, check_wildcard=True):
+    def _resolve_event(self, event, minimal=False, _wildcard_rdtypes=None):
         """
         Tag event with appropriate dns record types
         Optionally create child events from dns resolutions
         """
         event_tags = set()
-        try:
-            if not event.host or event.type in ("IP_RANGE",):
-                return [], set(), False, False, set()
-            children = []
-            event_host = str(event.host)
+        if not event.host or event.type in ("IP_RANGE",):
+            return [], set(), False, False, set()
+        children = []
+        event_host = str(event.host)
 
-            event_whitelisted = False
-            event_blacklisted = False
+        event_whitelisted = False
+        event_blacklisted = False
 
-            resolved_hosts = set()
+        resolved_hosts = set()
 
-            host_is_domain = is_domain(event_host)
+        # wildcard checks
+        if not is_ip(event.host):
+            # check if this domain is using wildcard dns
+            event_in_scope = event.scope_distance == 0
+            for hostname, wildcard_domain_rdtypes in self.is_wildcard_domain(
+                event_host, log_info=event_in_scope
+            ).items():
+                if wildcard_domain_rdtypes:
+                    event_tags.add("wildcard-domain")
+                    for rdtype, ips in wildcard_domain_rdtypes.items():
+                        event_tags.add(f"{rdtype.lower()}-wildcard-domain")
+            # check if the dns name itself is a wildcard entry
+            if _wildcard_rdtypes is None:
+                wildcard_rdtypes = self.is_wildcard(event_host)
+            else:
+                wildcard_rdtypes = _wildcard_rdtypes
+            for rdtype, (is_wildcard, wildcard_host) in wildcard_rdtypes.items():
+                wildcard_tag = "error"
+                if is_wildcard == True:
+                    event_tags.add("wildcard")
+                    wildcard_tag = "wildcard"
+                event_tags.add(f"{rdtype.lower()}-{wildcard_tag}")
 
-            # wildcard check first
-            if check_wildcard:
-                event_is_wildcard, wildcard_parent = self.is_wildcard(event_host)
-                if event_is_wildcard and event.type in ("DNS_NAME",):
-                    wildcard_data = f"_wildcard.{wildcard_parent}"
-                    if wildcard_data != event.data:
-                        log.debug(f'Wildcard detected, changing event.data "{event.data}" --> "{wildcard_data}"')
-                        event.data = wildcard_data
-                    return (event,)
-                elif event_is_wildcard is None:
-                    event_tags.add("dns-error")
-            elif not host_is_domain:
-                event_tags.add("wildcard")
+        # lock to ensure resolution of the same host doesn't start while we're working here
+        with self._event_cache_locks.get_lock(event_host):
+            # try to get data from cache
+            _event_tags, _event_whitelisted, _event_blacklisted, _resolved_hosts = self.event_cache_get(event_host)
+            event_tags.update(_event_tags)
+            # if we found it, return it
+            if _event_whitelisted is not None:
+                return children, event_tags, _event_whitelisted, _event_blacklisted, _resolved_hosts
 
-            # lock to ensure resolution of the same host doesn't start while we're working here
-            with self._event_cache_locks.get_lock(event_host):
-                # try to get data from cache
-                _event_tags, _event_whitelisted, _event_blacklisted, _resolved_hosts = self.event_cache_get(event_host)
-                event_tags.update(_event_tags)
-                # if we found it, return it
-                if _event_whitelisted is not None:
-                    return children, event_tags, _event_whitelisted, _event_blacklisted, _resolved_hosts
+            # then resolve
+            if event.type == "DNS_NAME" and not minimal:
+                types = self.all_rdtypes
+            else:
+                types = ("A", "AAAA")
 
-                # then resolve
-                if event.type == "DNS_NAME":
-                    types = "any"
-                else:
-                    types = ("A", "AAAA")
-                resolved_raw, errors = self.resolve_raw(event_host, type=types, cache_result=True)
-                if errors:
-                    event_tags.add("dns-error")
+            futures = {}
+            for t in types:
+                future = self.submit_task(
+                    self._catch_keyboardinterrupt, self.resolve_raw, event_host, type=t, cache_result=True
+                )
+                if future is None:
+                    break
+                futures[future] = t
+
+            for future in self.parent_helper.as_completed(futures):
+                resolved_raw, errors = future.result()
+                for rdtype, e in errors:
+                    event_tags.add(f"{rdtype.lower()}-error")
                 for rdtype, records in resolved_raw:
                     event_tags.add("resolved")
                     rdtype = str(rdtype).upper()
                     event_tags.add(f"{rdtype.lower()}-record")
-                    # whitelisting and blacklist of IPs
 
+                    # whitelisting and blacklisting of IPs
                     for r in records:
                         for _, t in self.extract_targets(r):
                             if t:
-                                if rdtype in ("A", "AAAA"):
+                                if rdtype in ("A", "AAAA", "CNAME"):
                                     ip = self.parent_helper.make_ip_type(t)
 
                                     with suppress(ValidationError):
-                                        if self.parent_helper.scan.whitelisted(ip):
-                                            event_whitelisted = True
+                                        if self.parent_helper.is_ip(ip):
+                                            if self.parent_helper.scan.whitelisted(ip):
+                                                event_whitelisted = True
                                     with suppress(ValidationError):
                                         if self.parent_helper.scan.blacklisted(ip):
                                             event_blacklisted = True
@@ -295,14 +322,53 @@ class DNSHelper:
                                 if self.filter_bad_ptrs and rdtype in ("PTR") and self.bad_ptr_regex.search(t):
                                     self.debug(f"Filtering out bad PTR: {t}")
                                     continue
-                                children.append((t, rdtype))
+                                children.append((rdtype, t))
 
-                if "resolved" not in event_tags:
-                    event_tags.add("unresolved")
-                self._event_cache[event_host] = (event_tags, event_whitelisted, event_blacklisted, resolved_hosts)
-            return children, event_tags, event_whitelisted, event_blacklisted, resolved_hosts
-        finally:
-            event._resolved.set()
+            # wildcard event modification (www.evilcorp.com --> _wildcard.evilcorp.com)
+            if not is_ip(event.host) and children and _wildcard_rdtypes is None:
+                # these are the rdtypes that successfully resolve
+                resolved_rdtypes = set([c[0].upper() for c in children])
+                # these are the rdtypes that have wildcards
+                wildcard_rdtypes_set = set(wildcard_rdtypes)
+                # consider the event a full wildcard if all its records are wildcards
+                event_is_wildcard = all(r in wildcard_rdtypes_set for r in resolved_rdtypes)
+                if event_is_wildcard and event.type in ("DNS_NAME",) and not "_wildcard" in event.data.split("."):
+                    wildcard_parent = self.parent_helper.parent_domain(event_host)
+                    for rdtype, (_is_wildcard, _parent_domain) in wildcard_rdtypes.items():
+                        if _is_wildcard:
+                            wildcard_parent = _parent_domain
+                            break
+                    wildcard_data = f"_wildcard.{wildcard_parent}"
+                    if wildcard_data != event.data:
+                        log.debug(f'Wildcard detected, changing event.data "{event.data}" --> "{wildcard_data}"')
+                        event.data = wildcard_data
+                    return (event, wildcard_rdtypes)
+
+            if not self.parent_helper.in_tests:
+                ips = set()
+                if event.type == "IP_ADDRESS":
+                    ips.add(event.data)
+                for rdtype, target in children:
+                    if rdtype in ("A", "AAAA"):
+                        ips.add(target)
+                for ip in ips:
+                    provider, provider_type, subnet = cloudcheck.check(ip)
+                    if provider:
+                        event_tags.add(f"{provider_type}-{provider}")
+
+            if "resolved" not in event_tags:
+                event_tags.add("unresolved")
+            for ip in resolved_hosts:
+                try:
+                    ip = ipaddress.ip_address(ip)
+                    if ip.is_private:
+                        event_tags.add("private-ip")
+                except ValueError:
+                    continue
+
+            self._event_cache[event_host] = (event_tags, event_whitelisted, event_blacklisted, resolved_hosts)
+
+        return children, event_tags, event_whitelisted, event_blacklisted, resolved_hosts
 
     def event_cache_get(self, host):
         try:
@@ -319,7 +385,9 @@ class DNSHelper:
         """
         futures = dict()
         for query in queries:
-            future = self._thread_pool.submit_task(self._catch_keyboardinterrupt, self.resolve, query, **kwargs)
+            future = self.submit_task(self._catch_keyboardinterrupt, self.resolve, query, **kwargs)
+            if future is None:
+                break
             futures[future] = query
         for future in self.parent_helper.as_completed(futures):
             query = futures[future]
@@ -352,14 +420,15 @@ class DNSHelper:
 
     @staticmethod
     def _clean_dns_record(record):
-        return str(record.to_text()).lower().rstrip(".")
+        with suppress(Exception):
+            record = str(record.to_text())
+        return str(record).rstrip(".").lower()
 
     def get_valid_resolvers(self, min_reliability=0.99):
         nameservers = set()
-        nameservers_url = "https://public-dns.info/nameserver/nameservers.json"
-        nameservers_file = self.parent_helper.download(nameservers_url, cache_hrs=72)
+        nameservers_file = self.parent_helper.download(self.nameservers_url, cache_hrs=72)
         if nameservers_file is None:
-            log.warning(f"Failed to download nameservers from {nameservers_url}")
+            log.warning(f"Failed to download nameservers from {self.nameservers_url}")
         else:
             nameservers_json = []
             try:
@@ -378,113 +447,13 @@ class DNSHelper:
                     continue
                 if reliability >= min_reliability and is_ip(ip, version=4):
                     nameservers.add(ip)
-            log.verbose(f"Loaded {len(nameservers):,} nameservers from {nameservers_url}")
+            log.verbose(f"Loaded {len(nameservers):,} nameservers from {self.nameservers_url}")
         if not nameservers:
             log.info(f"Loading fallback nameservers from {self.fallback_nameservers_file}")
             lines = self.parent_helper.read_file(self.fallback_nameservers_file)
             nameservers = set([l for l in lines if not l.startswith("#")])
         resolver_list = self.verify_nameservers(nameservers)
         return resolver_list
-
-    @property
-    def resolvers(self):
-        """
-        Returns set() of valid DNS servers from public-dns.info
-        """
-        if self._resolver_list is None:
-            file_content = self.parent_helper.cache_get("resolver_list")
-            if file_content is not None:
-                self._resolver_list = set([l for l in file_content.splitlines() if l])
-            if not self._resolver_list:
-                resolvers = self.get_valid_resolvers()
-                if resolvers:
-                    self._resolver_list = resolvers
-                    self.parent_helper.cache_put("resolver_list", "\n".join(self._resolver_list))
-                else:
-                    return set()
-        return self._resolver_list
-
-    @property
-    def mass_resolver_file(self):
-        self.resolvers
-        return self.parent_helper.cache_filename("resolver_list")
-
-    def verify_nameservers(self, nameservers, timeout=2):
-        """Check each resolver to make sure it can actually resolve DNS names
-
-        Args:
-            nameservers (list): nameservers to verify
-            timeout (int): timeout for dns query
-        """
-        log.info(f"Verifying {len(nameservers):,} public nameservers. Please be patient, this may take a while.")
-        futures = []
-        for nameserver in nameservers:
-            # don't use the system nameservers
-            if nameserver in self.system_resolvers:
-                continue
-            futures.append(
-                self._thread_pool.submit_task(self._catch_keyboardinterrupt, self.verify_nameserver, nameserver)
-            )
-
-        valid_nameservers = set()
-        for future in self.parent_helper.as_completed(futures):
-            nameserver, error = future.result()
-            if error is None:
-                self.debug(f'Nameserver "{nameserver}" is valid')
-                valid_nameservers.add(nameserver)
-            else:
-                self.debug(str(error))
-        if not valid_nameservers:
-            log.hugewarning(
-                "Unable to reach any nameservers. Please check your internet connection and ensure that DNS is not blocked outbound."
-            )
-        else:
-            log.info(f"Successfully verified {len(valid_nameservers):,}/{len(nameservers):,} nameservers")
-
-        return valid_nameservers
-
-    def verify_nameserver(self, nameserver, timeout=2):
-        """Validate a nameserver by making a sample query and a garbage query
-
-        Args:
-            nameserver (str): nameserver to verify
-            timeout (int): timeout for dns query
-        """
-        self.debug(f'Verifying nameserver "{nameserver}"')
-        error = None
-
-        resolver = dns.resolver.Resolver()
-        resolver.timeout = timeout
-        resolver.lifetime = timeout
-        resolver.nameservers = [nameserver]
-
-        # first, make sure it can resolve a valid hostname
-        try:
-            a_results = [str(r) for r in list(resolver.resolve("dns.google", "A"))]
-            aaaa_results = [str(r) for r in list(resolver.resolve("dns.google", "AAAA"))]
-            if not ("2001:4860:4860::8888" in aaaa_results and "8.8.8.8" in a_results):
-                error = f"Nameserver {nameserver} failed to resolve basic query"
-        except Exception:
-            error = f"Nameserver {nameserver} failed to resolve basic query within {timeout} seconds"
-
-        # then, make sure it isn't feeding us garbage data
-        randhost = f"www-m.{rand_string(9, digits=False)}.{rand_string(10, digits=False)}.com"
-        if error is None:
-            try:
-                a_results = list(resolver.resolve(randhost, "A"))
-                error = f"Nameserver {nameserver} returned garbage data"
-            except dns.exception.DNSException:
-                pass
-                # Garbage query to nameserver failed successfully ;)
-        if error is None:
-            try:
-                a_results = list(resolver.resolve(randhost, "AAAA"))
-                error = f"Nameserver {nameserver} returned garbage data"
-            except dns.exception.DNSException:
-                pass
-                # Garbage query to nameserver failed successfully ;)
-
-        return nameserver, error
 
     def _catch(self, callback, *args, **kwargs):
         try:
@@ -500,125 +469,170 @@ class DNSHelper:
             log.warning(f"Error in {callback.__qualname__}() with args={args}, kwargs={kwargs}")
         return list()
 
-    def is_wildcard(self, query, ips=None, retries=5):
+    def is_wildcard(self, query, ips=None, rdtype=None):
         """
         Use this method to check whether a *host* is a wildcard entry
 
-        This works (it will return False) for valid A-records in a wildcard domain.
+        This can reliably tell the difference between a valid DNS record and a wildcard inside a wildcard domain.
 
         If you want to know whether a domain is using wildcard DNS, use is_wildcard_domain() instead.
 
-        Note that this method returns a tuple: (is_wildcard, parent_domain) where parent_domain is
-        the highest level where wildcard checking occurred for that host.
+        Returns a dictionary in the following format:
+            {rdtype: (is_wildcard, wildcard_parent)}
 
-        e.g. if you are checking www.external.evilcorp.com and evilcorp.com is a wildcard domain,
-        this method will return (True, "evilcorp.com").
+            is_wildcard("www.github.io") --> {"A": (True, "github.io"), "AAAA": (True, "github.io")}
+
+        Note that is_wildcard can be True, False, or None (indicating that wildcard detection was inconclusive)
         """
-        query = str(query).lower().rstrip(".")
+        result = {}
+        if rdtype is None:
+            rdtype = "ANY"
+
+        query = self._clean_dns_record(query)
         # skip check if it's an IP
         if is_ip(query) or not "." in query:
-            return False, query
+            return {}
         # skip check if the query is a domain
         if is_domain(query):
-            return False, query
+            return {}
         # skip check if the query's parent domain is excluded in the config
         for d in self.wildcard_ignore:
             if self.parent_helper.host_in_host(query, d):
-                return False, query
-        # if it's already been marked as a wildcard, return True
-        if "_wildcard" in query.split("."):
-            return True, query.split("_wildcard.")[-1]
+                return {}
 
         parent = parent_domain(query)
         parents = list(domain_parents(query))
-        query_hash = hash(query)
 
-        # resolve the base query
+        futures = []
+        base_query_ips = dict()
+        # if the caller hasn't already done the work of resolving the IPs
         if ips is None:
-            query_ips = self.resolve(query, type=("A", "AAAA"), retries=retries, cache_result=True)
-        else:
-            query_ips = set(ips)
-        if not query_ips and query_hash not in self._wildcard_warnings:
-            # return None (inconclusive) if main query fails to resolve
-            self.debug(f"Wildcard detection failed for {query} because it failed to resolve")
-            self._wildcard_warnings.add(query_hash)
-            return None, parent
-
-        for host in parents[::-1]:
-            host_hash = hash(host)
-            if host_hash not in self._wildcard_cache:
-                self.is_wildcard_domain(host)
-            # if we've seen this domain before
-            if host_hash in self._wildcard_cache:
-                wildcard_ips = self._wildcard_cache[host_hash]
-                # otherwise check to see if the dns name matches the wildcard IPs
-                if wildcard_ips:
-                    # if the results are the same as the wildcard IPs, then ladies and gentlemen we have a wildcard
-                    is_wildcard = all(r in wildcard_ips for r in query_ips)
-                    if is_wildcard:
-                        return True, host
-            else:
-                log.warning(
-                    f"Wildcard DNS detection failed for {parent}. Recommend increasing dns_wildcard_tests in config."
+            # then resolve the query for all rdtypes
+            for _rdtype in self.all_rdtypes:
+                # resolve the base query
+                future = self.submit_task(
+                    self._catch_keyboardinterrupt, self.resolve_raw, query, type=_rdtype, cache_result=True
                 )
-                return None, host
-        return False, parent
+                if future is None:
+                    break
+                futures.append(future)
 
-    def is_wildcard_domain(self, domain, retries=5):
+            for future in self.parent_helper.as_completed(futures):
+                raw_results, errors = future.result()
+                if errors and not raw_results:
+                    self.debug(f"Failed to resolve {query} ({_rdtype}) during wildcard detection")
+                    result[_rdtype] = (None, parent)
+                    continue
+                for _rdtype, answers in raw_results:
+                    base_query_ips[_rdtype] = set()
+                    for answer in answers:
+                        for _, t in self.extract_targets(answer):
+                            base_query_ips[_rdtype].add(t)
+        else:
+            # otherwise, we can skip all that
+            base_query_ips[rdtype] = set([self._clean_dns_record(ip) for ip in ips])
+        if not base_query_ips:
+            return result
+
+        # once we've resolved the base query and have IP addresses to work with
+        # we can compare the IPs to the ones we have on file for wildcards
+        # for every rdtype
+        for _rdtype in self.all_rdtypes:
+            # get the IPs from above
+            query_ips = base_query_ips.get("ANY", base_query_ips.get(_rdtype, set()))
+            if not query_ips:
+                continue
+            # for every parent domain, starting with the longest
+            for host in parents[::-1]:
+                host_hash = hash(host)
+                # make sure we've checked that domain for wildcards
+                self.is_wildcard_domain(host)
+                if host_hash in self._wildcard_cache:
+                    # then get its IPs from our wildcard cache
+                    wildcard_rdtypes = self._wildcard_cache[host_hash]
+                    # then check to see if our IPs match the wildcard ones
+                    if _rdtype in wildcard_rdtypes:
+                        wildcard_ips = wildcard_rdtypes[_rdtype]
+                        # if our IPs match the wildcard ones, then ladies and gentlemen we have a wildcard
+                        is_wildcard = any(r in wildcard_ips for r in query_ips)
+                        if is_wildcard:
+                            result[_rdtype] = (True, host)
+                            break
+
+        return result
+
+    def is_wildcard_domain(self, domain, log_info=False):
         """
         Check whether a domain is using wildcard DNS
+
+        Returns a dictionary containing any DNS record types that are wildcards, and their associated IPs
+            is_wildcard_domain("github.io") --> {"A": {"1.2.3.4",}, "AAAA": {"dead::beef",}}
         """
-        domain = str(domain).lower().rstrip(".")
+        wildcard_domain_results = {}
+        domain = self._clean_dns_record(domain)
+
         # make a list of its parents
         parents = list(domain_parents(domain, include_self=True))
-        num_parents = len(parents)
-        # and check each of them, beginning with the highest parent (e.g. evilcorp.com)
+        # and check each of them, beginning with the highest parent (i.e. the root domain)
         for i, host in enumerate(parents[::-1]):
             # have we checked this host before?
             host_hash = hash(host)
             with self._wildcard_lock.get_lock(host_hash):
                 # if we've seen this host before
                 if host_hash in self._wildcard_cache:
-                    # return true if it's a wildcard
-                    if self._wildcard_cache[host_hash]:
-                        return True
-                    # return false if it's not a wildcard and it's the last one we're checking
-                    elif i + 1 == num_parents:
-                        return False
-                    # otherwise keep going
-                    else:
-                        continue
+                    wildcard_domain_results[host] = self._wildcard_cache[host_hash]
+                    continue
+
                 # determine if this is a wildcard domain
-                futures = []
+                wildcard_futures = {}
                 # resolve a bunch of random subdomains of the same parent
-                for _ in range(self.wildcard_tests):
-                    rand_query = f"{rand_string(digits=False, length=10)}.{host}"
-                    future = self._thread_pool.submit_task(
-                        self._catch_keyboardinterrupt, self.resolve, rand_query, retries=retries
-                    )
-                    futures.append(future)
+                for rdtype in self.all_rdtypes:
+                    # continue if a wildcard was already found for this rdtype
+                    # if rdtype in self._wildcard_cache[host_hash]:
+                    #     continue
+                    for _ in range(self.wildcard_tests):
+                        rand_query = f"{rand_string(digits=False, length=10)}.{host}"
+                        future = self.submit_task(
+                            self._catch_keyboardinterrupt,
+                            self.resolve,
+                            rand_query,
+                            type=rdtype,
+                            cache_result=False,
+                        )
+                        if future is None:
+                            break
+                        wildcard_futures[future] = rdtype
 
-                # put all the IPs from the random subdomains in one bucket
-                wildcard_ips = set()
-                for future in self.parent_helper.as_completed(futures):
-                    ips = future.result()
-                    if ips:
-                        wildcard_ips.update(ips)
+                # combine the random results
+                is_wildcard = False
+                wildcard_results = dict()
+                for future in self.parent_helper.as_completed(wildcard_futures):
+                    results = future.result()
+                    rdtype = wildcard_futures[future]
+                    if results:
+                        is_wildcard = True
+                    if results:
+                        if not rdtype in wildcard_results:
+                            wildcard_results[rdtype] = set()
+                        wildcard_results[rdtype].update(results)
 
-                self._wildcard_cache.update({host_hash: wildcard_ips})
-                if wildcard_ips:
-                    log.info(f"Encountered domain with wildcard DNS: {host}")
-                    return True
-        return False
+                self._wildcard_cache.update({host_hash: wildcard_results})
+                wildcard_domain_results.update({host: wildcard_results})
+                if is_wildcard:
+                    wildcard_rdtypes_str = ",".join(sorted([t.upper() for t, r in wildcard_results.items() if r]))
+                    log_fn = log.verbose
+                    if log_info:
+                        log_fn = log.info
+                    log_fn(f"Encountered domain with wildcard DNS ({wildcard_rdtypes_str}): {host}")
+
+        return wildcard_domain_results
 
     def _catch_keyboardinterrupt(self, callback, *args, **kwargs):
         try:
             return callback(*args, **kwargs)
         except Exception as e:
-            import traceback
-
             log.error(f"Error in {callback.__qualname__}(): {e}")
-            log.debug(traceback.format_exc())
+            log.trace(traceback.format_exc())
         except KeyboardInterrupt:
             if self.parent_helper.scan:
                 self.parent_helper.scan.stop()
@@ -635,3 +649,9 @@ class DNSHelper:
                 dummy_module = self.parent_helper._make_dummy_module(name=name, _type="DNS")
                 self._dummy_modules[name] = dummy_module
         return dummy_module
+
+    def dns_warning(self, msg):
+        msg_hash = hash(msg)
+        if msg_hash not in self._dns_warnings:
+            log.warning(msg)
+            self._dns_warnings.add(msg_hash)

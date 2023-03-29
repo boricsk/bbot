@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import copy
 import json
@@ -9,6 +10,7 @@ import shutil
 import signal
 import string
 import logging
+import platform
 import ipaddress
 import wordninja
 import subprocess as sp
@@ -24,7 +26,8 @@ from hashlib import sha1 as hashlib_sha1
 from .url import *  # noqa F401
 from . import regexes
 from .. import errors
-from .names_generator import random_name  # noqa F401
+from .punycode import *  # noqa F401
+from .names_generator import random_name, names, adjectives  # noqa F401
 
 log = logging.getLogger("bbot.core.helpers.misc")
 
@@ -57,6 +60,24 @@ def is_url(u):
         if r.match(u):
             return True
     return False
+
+
+uri_regex = re.compile(r"^([a-z0-9]{2,20})://", re.I)
+
+
+def is_uri(u, return_scheme=False):
+    """
+    is_uri("http://evilcorp.com") --> True
+    is_uri("ftp://evilcorp.com") --> True
+    is_uri("evilcorp.com") --> False
+    is_uri("ftp://evilcorp.com", return_scheme=True) --> "ftp"
+    """
+    match = uri_regex.match(u)
+    if return_scheme:
+        if match:
+            return match.groups()[0].lower()
+        return ""
+    return bool(match)
 
 
 def split_host_port(d):
@@ -313,7 +334,9 @@ def kill_children(parent_pid=None, sig=signal.SIGTERM):
             try:
                 child.send_signal(sig)
             except psutil.NoSuchProcess:
-                log.debug(f"No such PID: {parent_pid}")
+                log.debug(f"No such PID: {child.pid}")
+            except psutil.AccessDenied:
+                log.debug(f"Error killing PID: {child.pid} - access denied")
 
 
 def str_or_file(s):
@@ -345,8 +368,8 @@ def chain_lists(l, try_files=False, msg=None):
             f_path = Path(f).resolve()
             if try_files and f_path.is_file():
                 if msg is not None:
-                    msg = str(msg).format(filename=f_path)
-                    log.info(msg)
+                    new_msg = str(msg).format(filename=f_path)
+                    log.info(new_msg)
                 for line in str_or_file(f):
                     final_list[line] = None
             else:
@@ -452,32 +475,42 @@ def search_format_dict(d, **kwargs):
     return d
 
 
-def filter_dict(d, *key_names, fuzzy=False, invert=False):
+def filter_dict(d, *key_names, fuzzy=False, invert=False, exclude_keys=None, prev_key=None):
     """
     Recursively filter a dictionary based on key names
-    filter_dict({"key1": "test", "key2": "asdf"}, key_name=key2)
+    filter_dict({"key1": "test", "key2": "asdf"}, "key2")
         --> {"key2": "asdf"}
     """
+    if exclude_keys is None:
+        exclude_keys = []
+    if isinstance(exclude_keys, str):
+        exclude_keys = [exclude_keys]
     ret = {}
     if isinstance(d, dict):
         for key in d:
             if key in key_names or (fuzzy and any(k in key for k in key_names)):
-                ret[key] = copy.deepcopy(d[key])
+                if not prev_key in exclude_keys:
+                    ret[key] = copy.deepcopy(d[key])
             elif isinstance(d[key], list) or isinstance(d[key], dict):
-                child = filter_dict(d[key], *key_names, fuzzy=fuzzy)
+                child = filter_dict(d[key], *key_names, fuzzy=fuzzy, prev_key=key, exclude_keys=exclude_keys)
                 if child:
                     ret[key] = child
     return ret
 
 
-def clean_dict(d, *key_names, fuzzy=False):
+def clean_dict(d, *key_names, fuzzy=False, exclude_keys=None, prev_key=None):
+    if exclude_keys is None:
+        exclude_keys = []
+    if isinstance(exclude_keys, str):
+        exclude_keys = [exclude_keys]
     d = copy.deepcopy(d)
     if isinstance(d, dict):
         for key, val in list(d.items()):
             if key in key_names or (fuzzy and any(k in key for k in key_names)):
-                d.pop(key)
+                if prev_key not in exclude_keys:
+                    d.pop(key)
             else:
-                d[key] = clean_dict(val, *key_names, fuzzy=fuzzy)
+                d[key] = clean_dict(val, *key_names, fuzzy=fuzzy, prev_key=key, exclude_keys=exclude_keys)
     return d
 
 
@@ -676,6 +709,7 @@ def can_sudo_without_password():
     env = dict(os.environ)
     env["SUDO_ASKPASS"] = "/bin/false"
     try:
+        sp.run(["sudo", "-K"], stderr=sp.DEVNULL, stdout=sp.DEVNULL, check=True, env=env)
         sp.run(["sudo", "-An", "/bin/true"], stderr=sp.DEVNULL, stdout=sp.DEVNULL, check=True, env=env)
     except sp.CalledProcessError:
         return False
@@ -719,3 +753,62 @@ def make_table(*args, **kwargs):
         if k not in kwargs:
             kwargs[k] = v
     return tabulate(*args, **kwargs)
+
+
+def human_timedelta(d):
+    """
+    Format a TimeDelta object in human-readable form
+    """
+    hours, remainder = divmod(d.seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    result = []
+    if hours:
+        result.append(f"{hours:,} hour" + ("s" if hours > 1 else ""))
+    if minutes:
+        result.append(f"{minutes:,} minute" + ("s" if minutes > 1 else ""))
+    if seconds:
+        result.append(f"{seconds:,} second" + ("s" if seconds > 1 else ""))
+    return ", ".join(result)
+
+
+def cpu_architecture():
+    """
+    Returns the CPU architecture, e.g. "amd64, "armv7", "arm64", etc.
+    """
+    uname = platform.uname()
+    arch = uname.machine.lower()
+    if arch.startswith("aarch"):
+        return "arm64"
+    elif arch == "x86_64":
+        return "amd64"
+    return arch
+
+
+def os_platform():
+    """
+    Returns the OS platform, e.g. "linux", "darwin", "windows", etc.
+    """
+    return platform.system().lower()
+
+
+def os_platform_friendly():
+    """
+    Returns the OS platform in a more human-friendly format, because apple is indecisive
+    """
+    p = os_platform()
+    if p == "darwin":
+        return "macOS"
+    return p
+
+
+tag_filter_regex = re.compile(r"[^a-z0-9]+")
+
+
+def tagify(s):
+    """
+    Sanitize a string into a tag-friendly format
+
+    tagify("HTTP Web Title") --> "http-web-title"
+    """
+    ret = str(s).lower()
+    return tag_filter_regex.sub("-", ret).strip("-")

@@ -4,6 +4,7 @@ import traceback
 from sys import exc_info
 from pathlib import Path
 import concurrent.futures
+from datetime import datetime
 from omegaconf import OmegaConf
 from contextlib import suppress
 from collections import OrderedDict, deque
@@ -16,12 +17,12 @@ from .manager import ScanManager
 from .dispatcher import Dispatcher
 from bbot.modules import module_loader
 from bbot.core.event import make_event
-from bbot.core.logger import init_logging
 from bbot.core.helpers.misc import sha1, rand_string
 from bbot.core.helpers.helper import ConfigAwareHelper
+from bbot.core.logger import init_logging, get_log_level
 from bbot.core.helpers.names_generator import random_name
-from bbot.core.helpers.threadpool import ThreadPoolWrapper
 from bbot.core.configurator.environ import prepare_environment
+from bbot.core.helpers.threadpool import ThreadPoolWrapper, BBOTThreadPoolExecutor
 from bbot.core.errors import BBOTError, ScanError, ScanCancelledError, ValidationError
 
 log = logging.getLogger("bbot.scanner")
@@ -30,7 +31,6 @@ init_logging()
 
 
 class Scanner:
-
     _status_codes = {
         "NOT_STARTED": 0,
         "STARTING": 1,
@@ -84,17 +84,24 @@ class Scanner:
         self._status_code = 0
 
         # Set up thread pools
-        max_workers = max(1, self.config.get("max_threads", 100))
+        max_workers = max(1, self.config.get("max_threads", 25))
         # Shared thread pool, for module use
-        self._thread_pool = ThreadPoolWrapper(concurrent.futures.ThreadPoolExecutor(max_workers=max_workers))
+        self._thread_pool = BBOTThreadPoolExecutor(max_workers=max_workers)
         # Event thread pool, for event emission
-        self._event_thread_pool = ThreadPoolWrapper(concurrent.futures.ThreadPoolExecutor(max_workers=max_workers * 2))
-        self._event_thread_pool_qsize = 1000
+        self._event_thread_pool = ThreadPoolWrapper(
+            BBOTThreadPoolExecutor(max_workers=max_workers * 2), qsize=max_workers
+        )
         # Internal thread pool, for handle_event(), module setup, cleanup callbacks, etc.
-        self._internal_thread_pool = ThreadPoolWrapper(concurrent.futures.ThreadPoolExecutor(max_workers=max_workers))
+        self._internal_thread_pool = ThreadPoolWrapper(BBOTThreadPoolExecutor(max_workers=max_workers))
         self.process_pool = ThreadPoolWrapper(concurrent.futures.ProcessPoolExecutor())
-
         self.helpers = ConfigAwareHelper(config=self.config, scan=self)
+        self.pools = {
+            "process_pool": self.process_pool,
+            "internal_thread_pool": self._internal_thread_pool,
+            "dns_thread_pool": self.helpers.dns._thread_pool,
+            "event_thread_pool": self._event_thread_pool,
+            "main_thread_pool": self._thread_pool,
+        }
         output_dir = self.config.get("output_dir", "")
         if output_dir:
             self.home = Path(output_dir).resolve() / self.name
@@ -133,7 +140,16 @@ class Scanner:
         )
         self.scope_report_distance = int(self.config.get("scope_report_distance", 1))
 
+        # custom HTTP headers warning
+        self.custom_http_headers = self.config.get("http_headers", {})
+        if self.custom_http_headers:
+            self.warning(
+                "You have enabled custom HTTP headers. These will be attached to all in-scope requests and all requests made by httpx."
+            )
+
         self._prepped = False
+        self._thread_pools_shutdown = False
+        self._thread_pools_shutdown_threads = []
         self._cleanedup = False
 
     def prep(self):
@@ -161,7 +177,6 @@ class Scanner:
         deque(self.start(), maxlen=0)
 
     def start(self):
-
         self.prep()
 
         failed = True
@@ -169,6 +184,7 @@ class Scanner:
         if not self.target:
             self.warning(f"No scan targets specified")
 
+        scan_start_time = datetime.now()
         try:
             self.status = "STARTING"
 
@@ -210,15 +226,27 @@ class Scanner:
 
         except BBOTError as e:
             self.critical(f"Error during scan: {e}")
-            self.debug(traceback.format_exc())
+            self.trace()
 
         except Exception:
             self.critical(f"Unexpected error during scan:\n{traceback.format_exc()}")
 
         finally:
-
             self.cleanup()
-            self.shutdown_threadpools(wait=True)
+            self.shutdown_threadpools()
+            while 1:
+                for t in self._thread_pools_shutdown_threads:
+                    t.join(timeout=1)
+                    if t.is_alive():
+                        try:
+                            pool = t._args[0]
+                            for s in pool.threads_status:
+                                self.debug(s)
+                        except AttributeError:
+                            continue
+                if not any(t.is_alive() for t in self._thread_pools_shutdown_threads):
+                    self.debug("Finished shutting down thread pools")
+                    break
 
             log_fn = self.hugesuccess
             if self.status == "ABORTING":
@@ -230,7 +258,9 @@ class Scanner:
             else:
                 self.status = "FINISHED"
 
-            log_fn(f"Scan {self.name} completed with status {self.status}")
+            scan_run_time = datetime.now() - scan_start_time
+            scan_run_time = self.helpers.human_timedelta(scan_run_time)
+            log_fn(f"Scan {self.name} completed in {scan_run_time} with status {self.status}")
 
             self.dispatcher.on_finish(self)
 
@@ -279,30 +309,28 @@ class Scanner:
             self.status = "ABORTING"
             self.hugewarning(f"Aborting scan")
             self.helpers.kill_children()
-            self.shutdown_threadpools(wait=False)
+            self.shutdown_threadpools()
             self.helpers.kill_children()
 
-    def shutdown_threadpools(self, wait=True):
-        pools = [
-            self.process_pool,
-            self._internal_thread_pool,
-            self.helpers.dns._thread_pool,
-            self._event_thread_pool,
-            self._thread_pool,
-        ]
-        self.debug(f"Shutting down thread pools with wait={wait}")
-        threads = []
-        for pool in pools:
-            t = threading.Thread(target=pool.shutdown, kwargs={"wait": False, "cancel_futures": True}, daemon=True)
-            t.start()
-            threads.append(t)
-        if wait:
-            for t in threads:
-                t.join()
-        if wait:
-            for pool in pools:
-                pool.shutdown(wait=True)
-        self.debug("Finished shutting down thread pools")
+    def shutdown_threadpools(self):
+        if not self._thread_pools_shutdown:
+            self._thread_pools_shutdown = True
+
+            def shutdown_pool(pool, pool_name, **kwargs):
+                self.debug(f"Shutting down {pool_name} with kwargs={kwargs}")
+                pool.shutdown(**kwargs)
+                self.debug(f"Finished shutting down {pool_name} with kwargs={kwargs}")
+
+            self.debug(f"Shutting down thread pools")
+            for pool_name, pool in self.pools.items():
+                t = threading.Thread(
+                    target=shutdown_pool,
+                    args=(pool, pool_name),
+                    kwargs={"wait": True, "cancel_futures": True},
+                    daemon=True,
+                )
+                t.start()
+                self._thread_pools_shutdown_threads.append(t)
 
     def cleanup(self):
         # clean up modules
@@ -372,16 +400,12 @@ class Scanner:
 
     @property
     def status_detailed(self):
-        main_tasks = self._thread_pool.num_tasks
-        dns_tasks = self.helpers.dns._thread_pool.num_tasks
         event_threadpool_tasks = self._event_thread_pool.num_tasks
         internal_tasks = self._internal_thread_pool.num_tasks
         process_tasks = self.process_pool.num_tasks
-        total_tasks = main_tasks + dns_tasks + internal_tasks
+        total_tasks = event_threadpool_tasks + internal_tasks + process_tasks
         status = {
             "queued_tasks": {
-                "main": main_tasks,
-                "dns": dns_tasks,
                 "internal": internal_tasks,
                 "process": process_tasks,
                 "event": event_threadpool_tasks,
@@ -455,23 +479,23 @@ class Scanner:
 
     def warning(self, *args, **kwargs):
         log.warning(*args, extra={"scan_id": self.id}, **kwargs)
-        self._log_traceback()
+        self.trace()
 
     def hugewarning(self, *args, **kwargs):
         log.hugewarning(*args, extra={"scan_id": self.id}, **kwargs)
-        self._log_traceback()
+        self.trace()
 
     def error(self, *args, **kwargs):
         log.error(*args, extra={"scan_id": self.id}, **kwargs)
-        self._log_traceback()
+        self.trace()
+
+    def trace(self):
+        e_type, e_val, e_traceback = exc_info()
+        if e_type is not None:
+            log.trace(traceback.format_exc())
 
     def critical(self, *args, **kwargs):
         log.critical(*args, extra={"scan_id": self.id}, **kwargs)
-
-    def _log_traceback(self):
-        e_type, e_val, e_traceback = exc_info()
-        if e_type is not None:
-            self.debug(traceback.format_exc())
 
     def _internal_modules(self):
         for modname in module_loader.preloaded(type="internal"):
@@ -479,9 +503,7 @@ class Scanner:
                 yield modname
 
     def load_modules(self):
-
         if not self._modules_loaded:
-
             all_modules = list(set(self._scan_modules + self._output_modules + self._internal_modules))
             if not all_modules:
                 self.warning(f"No modules to load")
@@ -549,8 +571,11 @@ class Scanner:
         else:
             raise ScanError(msg)
 
-    def _load_modules(self, modules):
+    @property
+    def log_level(self):
+        return get_log_level()
 
+    def _load_modules(self, modules):
         modules = [str(m) for m in modules]
         loaded_modules = {}
         failed = set()

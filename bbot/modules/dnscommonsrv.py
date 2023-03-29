@@ -97,8 +97,8 @@ class dnscommonsrv(BaseModule):
     max_event_handlers = 10
 
     def filter_event(self, event):
-        is_wildcard, _ = self.helpers.is_wildcard(event.host)
-        if is_wildcard != False:
+        # skip SRV wildcards
+        if "SRV" in self.helpers.is_wildcard(event.host):
             return False
         return True
 
@@ -106,4 +106,4 @@ class dnscommonsrv(BaseModule):
         queries = [event.data] + [f"{srv}.{event.data}" for srv in common_srvs]
         for query, results in self.helpers.resolve_batch(queries, type="srv"):
             if results:
-                self.emit_event(query, "DNS_NAME", tags=["srv_record"], source=event)
+                self.emit_event(query, "DNS_NAME", tags=["srv-record"], source=event)

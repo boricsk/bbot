@@ -5,8 +5,7 @@ from .crobat import crobat
 
 
 class massdns(crobat):
-
-    flags = ["brute-force", "subdomain-enum", "passive", "slow", "aggressive"]
+    flags = ["subdomain-enum", "passive", "slow", "aggressive"]
     watched_events = ["DNS_NAME"]
     produced_events = ["DNS_NAME"]
     meta = {"description": "Brute-force subdomains with massdns (highly effective)"}
@@ -17,7 +16,12 @@ class massdns(crobat):
     options_desc = {"wordlist": "Subdomain wordlist URL", "max_resolvers": "Number of concurrent massdns resolvers"}
     subdomain_file = None
     deps_ansible = [
-        {"name": "install dev tools", "package": {"name": ["gcc", "git", "make"], "state": "present"}, "become": True},
+        {
+            "name": "install dev tools",
+            "package": {"name": ["gcc", "git", "make"], "state": "present"},
+            "become": True,
+            "ignore_errors": True,
+        },
         {
             "name": "Download massdns source code",
             "git": {
@@ -28,31 +32,60 @@ class massdns(crobat):
             },
         },
         {
-            "name": "Build massdns",
+            "name": "Build massdns (Linux)",
             "command": {"chdir": "#{BBOT_TEMP}/massdns", "cmd": "make", "creates": "#{BBOT_TEMP}/massdns/bin/massdns"},
+            "when": "ansible_facts['system'] == 'Linux'",
+        },
+        {
+            "name": "Build massdns (non-Linux)",
+            "command": {
+                "chdir": "#{BBOT_TEMP}/massdns",
+                "cmd": "make nolinux",
+                "creates": "#{BBOT_TEMP}/massdns/bin/massdns",
+            },
+            "when": "ansible_facts['system'] != 'Linux'",
         },
         {
             "name": "Install massdns",
             "copy": {"src": "#{BBOT_TEMP}/massdns/bin/massdns", "dest": "#{BBOT_TOOLS}/", "mode": "u+x,g+x,o+x"},
         },
     ]
+    _qsize = 100
 
     def setup(self):
         self.found = dict()
         self.mutations_tried = set()
         self.source_events = dict()
         self.subdomain_file = self.helpers.wordlist(self.config.get("wordlist"))
-        ret = super().setup()
-        if not len(self.helpers.resolvers) >= 100:
-            return None, "Not enough nameservers available for DNS brute-forcing"
-        return ret
+        self.max_resolvers = self.config.get("max_resolvers", 500)
+        nameservers_url = (
+            "https://raw.githubusercontent.com/blacklanternsecurity/public-dns-servers/master/nameservers.txt"
+        )
+        self.resolver_file = self.helpers.wordlist(
+            nameservers_url,
+            cache_hrs=24 * 7,
+        )
+        return super().setup()
 
     def filter_event(self, event):
-        if "unresolved" in event.tags:
-            return False
         query = self.make_query(event)
         if self.already_processed(query):
-            return False
+            return False, "Event was already processed"
+        is_cloud = False
+        if any(t.startswith("cloud-") for t in event.tags):
+            is_cloud = True
+        is_wildcard = False
+        for domain, wildcard_rdtypes in self.helpers.is_wildcard_domain(query).items():
+            if any(t in wildcard_rdtypes for t in ("A", "AAAA", "CNAME")):
+                is_wildcard = True
+        if "unresolved" in event.tags:
+            if not "target" in event.tags:
+                return False, "Event is unresolved"
+        if is_cloud:
+            if event not in self.scan.target:
+                return False, "Event is a cloud resource and not a direct target"
+        if is_wildcard and is_cloud:
+            return False, "Event is both a cloud resource and a wildcard domain"
         self.processed.add(hash(query))
         return True
 
@@ -62,22 +95,19 @@ class massdns(crobat):
         if not h in self.source_events:
             self.source_events[h] = event
 
-        # make sure base query resolves
-        if not self.helpers.resolve(query, type="any"):
-            self.debug(f"Skipping unresolved query: {query}")
-            return
-
         self.info(f"Brute-forcing subdomains for {query}")
         for hostname in self.massdns(query, self.helpers.read_file(self.subdomain_file)):
             self.emit_result(hostname, event, query)
 
     def abort_if(self, event):
-        # abort if the event is a wildcard
+        if not event.scope_distance == 0:
+            return True, "event is not in scope"
+        if "unresolved" in event.tags:
+            return True, "event is unresolved"
         if "wildcard" in event.tags:
-            return True
-        # abort if the event is not a valid record type
+            return True, "event is a wildcard"
         if not any(x in event.tags for x in ("a-record", "aaaa-record", "cname-record")):
-            return True
+            return True, "event is not a valid record type"
 
     def emit_result(self, result, source_event, query):
         if not result == source_event:
@@ -92,6 +122,18 @@ class massdns(crobat):
         return False
 
     def massdns(self, domain, subdomains):
+        canary_checks = 50
+        canary_subdomains = [self.helpers.rand_string(10) for i in range(canary_checks)]
+        self.verbose(f"Testing {canary_checks:,} canaries against {domain}")
+        canary_results = list(self._massdns(domain, canary_subdomains))
+        if len(canary_results) > 10:
+            self.info(
+                f"Aborting massdns run on {domain} due to {len(canary_results):,}/{canary_checks:,} false positives"
+            )
+        else:
+            yield from self._massdns(domain, subdomains)
+
+    def _massdns(self, domain, subdomains):
         """
         {
           "name": "www.blacklanternsecurity.com.",
@@ -122,12 +164,18 @@ class massdns(crobat):
         if self.scan.stopping:
             return
 
+        domain_wildcard_rdtypes = set()
+        for domain, rdtypes in self.helpers.is_wildcard_domain(domain).items():
+            for rdtype, results in rdtypes.items():
+                if results:
+                    domain_wildcard_rdtypes.add(rdtype)
+
         command = (
             "massdns",
             "-r",
-            self.helpers.dns.mass_resolver_file,
+            self.resolver_file,
             "-s",
-            self.config.get("max_resolvers", 1000),
+            self.max_resolvers,
             "-t",
             "A",
             "-t",
@@ -137,6 +185,7 @@ class massdns(crobat):
             "-q",
         )
         subdomains = self.gen_subdomains(subdomains, domain)
+        hosts_yielded = set()
         for line in self.helpers.run_live(command, stderr=subprocess.DEVNULL, input=subdomains):
             try:
                 j = json.loads(line)
@@ -144,19 +193,33 @@ class massdns(crobat):
                 self.debug(f"Failed to decode line: {line}")
                 continue
             answers = j.get("data", {}).get("answers", [])
-            if type(answers) == list:
-                for answer in answers:
-                    hostname = answer.get("name", "")
-                    if hostname:
-                        data = answer.get("data", "")
-                        # avoid garbage answers like this:
-                        # 8AAAA queries have been locally blocked by dnscrypt-proxy/Set block_ipv6 to false to disable this feature
-                        if not " " in data:
-                            is_wildcard, _ = self.helpers.is_wildcard(hostname, ips=(data,))
-                            rdtype = answer.get("type", "").upper()
-                            # as long as it's not a wildcard we're okay
-                            if rdtype not in ("A", "AAAA") or is_wildcard == False:
-                                yield hostname.rstrip(".")
+            if type(answers) == list and len(answers) > 0:
+                answer = answers[0]
+                hostname = answer.get("name", "")
+                if hostname:
+                    data = answer.get("data", "")
+                    rdtype = answer.get("type", "").upper()
+                    # avoid garbage answers like this:
+                    # 8AAAA queries have been locally blocked by dnscrypt-proxy/Set block_ipv6 to false to disable this feature
+                    if data and rdtype and not " " in data:
+                        # skip wildcards
+                        if rdtype in domain_wildcard_rdtypes:
+                            # skip wildcard checking on multi-level subdomains for performance reasons
+                            stem = hostname.split(domain)[0].strip(".")
+                            if "." in stem:
+                                self.debug(
+                                    f"Skipping {hostname}:{rdtype} because it may be a wildcard (reason: performance)"
+                                )
+                                continue
+                            wildcard_rdtypes = self.helpers.is_wildcard(hostname, ips=(data,))
+                            if rdtype in wildcard_rdtypes:
+                                self.debug(f"Skipping {hostname}:{rdtype} because it's a wildcard")
+                                continue
+                        hostname = hostname.rstrip(".").lower()
+                        hostname_hash = hash(hostname)
+                        if hostname_hash not in hosts_yielded:
+                            hosts_yielded.add(hostname_hash)
+                            yield hostname
 
     def finish(self):
         found = list(self.found.items())
@@ -202,7 +265,8 @@ class massdns(crobat):
 
     def gen_subdomains(self, prefixes, domain):
         for p in prefixes:
-            yield f"{p}.{domain}"
+            d = f"{p}.{domain}"
+            yield d
 
     def get_source_event(self, hostname):
         for p in self.helpers.domain_parents(hostname):

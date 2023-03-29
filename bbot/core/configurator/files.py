@@ -1,5 +1,4 @@
 from pathlib import Path
-from shutil import copyfile
 from omegaconf import OmegaConf
 
 from ..helpers.misc import mkdir
@@ -8,11 +7,10 @@ from ..helpers.logger import log_to_stderr
 
 config_dir = (Path.home() / ".config" / "bbot").resolve()
 defaults_filename = (Path(__file__).parent.parent.parent / "defaults.yml").resolve()
-defaults_destination = config_dir / "defaults.yml"
 mkdir(config_dir)
-copyfile(defaults_filename, defaults_destination)
 config_filename = (config_dir / "bbot.yml").resolve()
 secrets_filename = (config_dir / "secrets.yml").resolve()
+default_config = None
 
 
 def _get_config(filename, name="config", notify=True):
@@ -29,9 +27,10 @@ def _get_config(filename, name="config", notify=True):
 
 
 def get_config():
-
+    global default_config
+    default_config = _get_config(defaults_filename, name="defaults")
     return OmegaConf.merge(
-        _get_config(defaults_filename, name="defaults"),
+        default_config,
         _get_config(config_filename, name="config"),
         _get_config(secrets_filename, name="secrets"),
     )
